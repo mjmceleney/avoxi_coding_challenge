@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: geoip-api
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: maxmind-credentials
+  namespace: geoip-api
+type: Opaque
+stringData:
+  account-id: "YOUR_ACCOUNT_ID"
+  license-key: "YOUR_LICENSE_KEY"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geoip-api
+  namespace: geoip-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: geoip-api
+  template:
+    metadata:
+      labels:
+        app: geoip-api
+    spec:
+      initContainers:
+        - name: geoipupdate
+          image: ghcr.io/maxmind/geoipupdate:latest
+          restartPolicy: Always
+          env:
+            - name: GEOIPUPDATE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: maxmind-credentials
+                  key: account-id
+            - name: GEOIPUPDATE_LICENSE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: maxmind-credentials
+                  key: license-key
+            - name: GEOIPUPDATE_EDITION_IDS
+              value: GeoLite2-Country
+            - name: GEOIPUPDATE_FREQUENCY
+              value: "24"
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/usr/share/GeoIP/GeoLite2-Country.mmdb"]
+            periodSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - name: geoip
+              mountPath: /usr/share/GeoIP
+      containers:
+        - name: app
+          image: YOUR_REGISTRY/geoip-api:TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: DB_PATH
+              value: /usr/share/GeoIP/GeoLite2-Country.mmdb
+            - name: ADDR
+              value: ":8080"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: geoip
+              mountPath: /usr/share/GeoIP
+              readOnly: true
+      volumes:
+        - name: geoip
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: geoip-api
+  namespace: geoip-api
+spec:
+  type: ClusterIP
+  selector:
+    app: geoip-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
