@@ -32,7 +32,7 @@ spec:
     spec:
       initContainers:
         - name: geoipupdate
-          image: ghcr.io/maxmind/geoipupdate:latest
+          image: ghcr.io/maxmind/geoipupdate:v8.0.0
           restartPolicy: Always
           env:
             - name: GEOIPUPDATE_ACCOUNT_ID
@@ -61,6 +61,9 @@ spec:
         - name: app
           image: YOUR_REGISTRY/geoip-api:TAG
           imagePullPolicy: IfNotPresent
+          # Bypass the image's entrypoint (which runs geoipupdate itself); the sidecar above
+          # keeps the database fresh.
+          command: ["/app"]
           ports:
             - name: http
               containerPort: 8080

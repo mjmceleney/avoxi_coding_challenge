@@ -25,7 +25,7 @@ const maxRequestBytes = 64 << 10
 //
 //	POST /v1/check   {"ip": "1.2.3.4", "allowed_countries": ["US", "GB"]}
 //	              -> {"country": "US", "allowed": true}
-//	GET  /healthz    -> 200 once a database is loaded
+//	GET  /health    -> 200 once a database is loaded
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/check", s.handleCheck)

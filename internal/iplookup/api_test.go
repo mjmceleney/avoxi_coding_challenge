@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-const testDBPath = "../geolite_database/GeoLite2-Country.mmdb"
+const testDBPath = "../../data/GeoLite2-Country.mmdb"
 
 func newTestService(t *testing.T) *Service {
 	t.Helper()

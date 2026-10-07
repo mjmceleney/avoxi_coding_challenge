@@ -10,13 +10,13 @@ import (
 	"syscall"
 	"time"
 
-	"iplookup/iplookup"
+	"iplookup/internal/iplookup"
 )
 
 func main() {
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
-		dbPath = "geolite_database/GeoLite2-Country.mmdb"
+		dbPath = "data/GeoLite2-Country.mmdb"
 	}
 	addr := os.Getenv("ADDR")
 	if addr == "" {

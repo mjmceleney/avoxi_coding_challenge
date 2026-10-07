@@ -62,21 +62,21 @@ EditionIDs GeoLite2-Country
 From the repository root:
 
 ```sh
-geoipupdate -f path/to/GeoIP.conf -d geolite_database
+geoipupdate -f path/to/GeoIP.conf -d data
 ```
 
-This writes `geolite_database/GeoLite2-Country.mmdb`. Run the same command again whenever you want a fresh copy. To keep it updated automatically, schedule it with Task Scheduler on Windows or cron on macOS/Linux, for example once a day.
+This writes `data/GeoLite2-Country.mmdb`. Run the same command again whenever you want a fresh copy. To keep it updated automatically, schedule it with Task Scheduler on Windows or cron on macOS/Linux, for example once a day.
 
 ### 4. Run the application
 
 ```sh
 # macOS / Linux / Git Bash
-DB_PATH=geolite_database/GeoLite2-Country.mmdb go run .
+DB_PATH=data/GeoLite2-Country.mmdb go run ./cmd/server
 ```
 
 ```powershell
 # PowerShell
-$env:DB_PATH = "geolite_database/GeoLite2-Country.mmdb"; go run .
+$env:DB_PATH = "data/GeoLite2-Country.mmdb"; go run ./cmd/server
 ```
 
 ---
@@ -95,7 +95,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /app .
+RUN CGO_ENABLED=0 go build -o /app ./cmd/server
 
 FROM gcr.io/distroless/static
 COPY --from=build /app /app
