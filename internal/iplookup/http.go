@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 )
 
 // CheckRequest is the JSON body accepted by the check endpoint.
@@ -25,7 +26,7 @@ const maxRequestBytes = 64 << 10
 //
 //	POST /v1/check   {"ip": "1.2.3.4", "allowed_countries": ["US", "GB"]}
 //	              -> {"country": "US", "allowed": true}
-//	GET  /health    -> 200 once a database is loaded
+//	GET  /health    -> {"status": "ok", "database_build": "2026-10-06T21:21:33Z"}
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/check", s.handleCheck)
@@ -41,17 +42,11 @@ func (s *Service) handleCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body: " + err.Error()})
 		return
 	}
-	if len(req.AllowedCountries) == 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "allowed_countries must not be empty"})
-		return
-	}
 
 	res, err := s.Check(req.IP, req.AllowedCountries)
 	switch {
-	case errors.Is(err, ErrInvalidIP):
+	case errors.Is(err, ErrInvalidArgument):
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
-	case errors.Is(err, ErrNotLoaded):
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: err.Error()})
 	case err != nil:
 		log.Println("Error checking IP:", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "lookup failed"})
@@ -60,12 +55,19 @@ func (s *Service) handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// healthResponse is the JSON body returned by the health endpoint.
+type healthResponse struct {
+	Status string `json:"status"`
+	// DatabaseBuild is when MaxMind built the loaded database, so monitoring can alert on
+	// stale data.
+	DatabaseBuild time.Time `json:"database_build"`
+}
+
+// handleHealth always reports ok: New guarantees a database is loaded, and a failed reload
+// keeps serving the previous one. A stale database is reported but doesn't fail the
+// check, since every replica would go stale at once and take the whole service down.
 func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if s.current.Load() == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: ErrNotLoaded.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", DatabaseBuild: s.DatabaseBuild()})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

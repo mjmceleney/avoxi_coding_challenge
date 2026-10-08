@@ -68,11 +68,16 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
           env:
             - name: DB_PATH
               value: /usr/share/GeoIP/GeoLite2-Country.mmdb
             - name: ADDR
               value: ":8080"
+            - name: GRPC_ADDR
+              value: ":9090"
           livenessProbe:
             httpGet:
               path: /health
@@ -118,4 +123,8 @@ spec:
     - name: http
       port: 80
       targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: 9090
+      targetPort: grpc
       protocol: TCP

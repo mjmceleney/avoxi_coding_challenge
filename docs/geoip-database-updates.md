@@ -1,44 +1,69 @@
 # GeoIP Database Updates
 
-The service looks up the country of an IP address using MaxMind's **GeoLite2-Country** database (a `.mmdb` file). The application never downloads this file itself. Keeping it current is the job of [`geoipupdate`](https://github.com/maxmind/geoipupdate), MaxMind's official update tool, running alongside the application.
+The service looks up the country of an IP address using MaxMind's **GeoLite2-Country** database (a `.mmdb` file). The service never downloads the file itself. Keeping it current is the job of [geoipupdate](https://github.com/maxmind/geoipupdate), MaxMind's official update tool, running alongside it.
+
+This guide covers how updates work, how to set them up in each environment, and how to check they are working.
+
+- [How it works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Running locally](#running-locally)
+- [Running in Docker](#running-in-docker)
+- [Running in Kubernetes](#running-in-kubernetes)
+- [Monitoring freshness](#monitoring-freshness)
+- [Licence obligations](#licence-obligations)
+- [Troubleshooting](#troubleshooting)
 
 ## How it works
 
-1. **geoipupdate** downloads the latest database from MaxMind and writes it to a directory. It writes to a temporary file first and then renames it over the old one, so the database file is never seen half-written.
-2. **The application** reads the file at `DB_PATH` fully into memory on startup. If the file is missing or invalid, it exits with an error.
-3. Every minute, the application checks the file's modification time. When it changes, the new file is loaded into memory and swapped in atomically:
-   - Lookups already in progress finish on the old copy.
-   - New lookups use the new copy.
-   - No lookup ever waits on a lock.
-   - If a reload fails, the application logs the error and keeps serving the copy it already has.
+1. **geoipupdate downloads the latest database** from MaxMind and writes it to a directory. It writes to a temporary file first and then renames it over the old one, so the service never sees a half-written file. MaxMind publishes GeoLite2 updates twice a week.
+2. **The service reads the file at `DB_PATH` fully into memory on startup**, and logs the database's build date. If the file is missing or invalid, it exits with an error.
+3. **Every minute, the service checks the file's modification time.** When it changes, the new file is loaded into memory and swapped in atomically:
+   - Lookups already in progress finish on the old copy, and new lookups use the new copy.
+   - No lookup waits on a lock, and no restart is needed.
+   - If a reload fails, the service logs the error and keeps serving the copy it already has, then tries again a minute later.
 
-Because the file is only open while it is being read, geoipupdate can replace it at any time without affecting the running application.
+Because the file is only open while it is being read, geoipupdate can replace it at any time without affecting the running service, even on network storage.
 
-> **Note:** `main` currently performs a single demo lookup and exits. The reload loop only matters once the service runs as a long-lived API.
+## Prerequisites
 
-## Prerequisites (all environments)
+You need a MaxMind account and license key:
 
-- A MaxMind account with a license key. Sign up for GeoLite2 at <https://www.maxmind.com/en/geolite2/signup>, then generate a key under **Account → Manage License Keys**.
-- Your **Account ID** and **License Key**. Treat the license key as a secret.
+1. Sign up for a free GeoLite account at <https://www.maxmind.com/en/geolite2/signup>.
+2. Generate a license key under **Account → Manage License Keys**.
+3. Note your **account ID** and **license key**. Treat the license key as a secret.
 
-MaxMind limits how many databases an account can download per day. Every running copy of geoipupdate counts against that limit, so avoid running more updaters than you need.
+MaxMind limits how many databases an account can download per day. Every running copy of geoipupdate counts against that limit, so don't run more updaters than you need (see [Scaling considerations](#scaling-considerations)).
 
 ### Configuration reference
 
 | Setting | Used by | Description |
 |---|---|---|
-| `DB_PATH` | Application | Path to `GeoLite2-Country.mmdb` |
+| `DB_PATH` | Service | Path to `GeoLite2-Country.mmdb` (default `data/GeoLite2-Country.mmdb`) |
 | `AccountID` / `GEOIPUPDATE_ACCOUNT_ID` | geoipupdate | MaxMind account ID |
 | `LicenseKey` / `GEOIPUPDATE_LICENSE_KEY` | geoipupdate | MaxMind license key |
 | `EditionIDs` / `GEOIPUPDATE_EDITION_IDS` | geoipupdate | Always `GeoLite2-Country` |
-| `GEOIPUPDATE_FREQUENCY` | geoipupdate (Docker image) | Hours between updates. If unset, it runs once and exits |
-| `GEOIPUPDATE_DB_DIR` | geoipupdate (Docker image) | Output directory (default `/usr/share/GeoIP`) |
+| `GEOIPUPDATE_FREQUENCY` | geoipupdate (Docker images) | Hours between updates. If unset, it runs once and exits |
+| `GEOIPUPDATE_DB_DIR` | geoipupdate (Docker images) | Output directory (default `/usr/share/GeoIP`) |
+
+The left-hand names are for the geoipupdate CLI's config file; the `GEOIPUPDATE_*` names are environment variables.
 
 ---
 
 ## Running locally
 
-### 1. Install geoipupdate
+### 1. Download the database
+
+**With Docker** (any OS), a one-off run of the geoipupdate image writes the database into `data/` and exits:
+
+```bash
+docker run --rm -v "$(pwd)/data:/usr/share/GeoIP" \
+  -e GEOIPUPDATE_ACCOUNT_ID=<your-account-id> \
+  -e GEOIPUPDATE_LICENSE_KEY=<your-license-key> \
+  -e GEOIPUPDATE_EDITION_IDS=GeoLite2-Country \
+  ghcr.io/maxmind/geoipupdate:v8.0.0
+```
+
+**With the geoipupdate CLI**, install it:
 
 | OS | Install |
 |---|---|
@@ -47,9 +72,7 @@ MaxMind limits how many databases an account can download per day. Every running
 | Ubuntu/Debian | `sudo add-apt-repository ppa:maxmind/ppa && sudo apt install geoipupdate`, or install the `.deb` from the releases page |
 | Other Linux | Install the `.rpm` or `.tar.gz` from the releases page |
 
-### 2. Create a config file
-
-Create `GeoIP.conf` outside the repository, or add it to `.gitignore`, because it contains your license key:
+Then create a `GeoIP.conf` file **outside the repository**, because it contains your license key:
 
 ```
 AccountID YOUR_ACCOUNT_ID
@@ -57,66 +80,65 @@ LicenseKey YOUR_LICENSE_KEY
 EditionIDs GeoLite2-Country
 ```
 
-### 3. Download the database
-
-From the repository root:
+From the repository root, run:
 
 ```sh
 geoipupdate -f path/to/GeoIP.conf -d data
 ```
 
-This writes `data/GeoLite2-Country.mmdb`. Run the same command again whenever you want a fresh copy. To keep it updated automatically, schedule it with Task Scheduler on Windows or cron on macOS/Linux, for example once a day.
+Either way, the result is `data/GeoLite2-Country.mmdb`, which is git-ignored.
 
-### 4. Run the application
+### 2. Run the service
 
 ```sh
-# macOS / Linux / Git Bash
-DB_PATH=data/GeoLite2-Country.mmdb go run ./cmd/server
+go run ./cmd/server
 ```
 
-```powershell
-# PowerShell
-$env:DB_PATH = "data/GeoLite2-Country.mmdb"; go run ./cmd/server
-```
+`data/GeoLite2-Country.mmdb` is the default `DB_PATH`, so no configuration is needed.
+
+### 3. Keep it updated
+
+Re-run the download command whenever you want fresh data. To automate it, schedule it with Task Scheduler on Windows or cron on macOS/Linux, for example daily. A running service picks up each new file within a minute.
 
 ---
 
 ## Running in Docker
 
-In Docker, MaxMind's official image `ghcr.io/maxmind/geoipupdate` runs as its own container. It writes into a volume that the application container also mounts.
+### Built-in updater (default)
 
-### 1. Build an application image
+The image built from [deploy/Dockerfile](../deploy/Dockerfile) is based on MaxMind's geoipupdate image, and its entrypoint keeps the database current by itself:
 
-The repository does not include a Dockerfile yet. A minimal one:
+1. On startup, it runs geoipupdate once. If that fails (for example, because of bad credentials), the container exits rather than starting without data.
+2. It starts a background loop that runs geoipupdate every `GEOIPUPDATE_FREQUENCY` hours (default 24). Failures are logged and retried on the next cycle, and the service keeps serving the data it has.
+3. It starts the service, which reads from `/usr/share/GeoIP/GeoLite2-Country.mmdb`.
 
-```dockerfile
-FROM golang:1.27 AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o /app ./cmd/server
+Credentials are supplied at runtime, never baked into the image:
 
-FROM gcr.io/distroless/static
-COPY --from=build /app /app
-ENTRYPOINT ["/app"]
+```bash
+docker build -f deploy/Dockerfile -t avoxi-coding-challenge .
+docker run -d --rm --name avoxi -p 8080:8080 -p 9090:9090 \
+  -e GEOIPUPDATE_ACCOUNT_ID=<your-account-id> \
+  -e GEOIPUPDATE_LICENSE_KEY=<your-license-key> \
+  avoxi-coding-challenge
 ```
 
-### 2. Run with Docker Compose
+The data lives inside the container, so each new container downloads it again on startup. That's fine for a single long-running container; for many containers, see [Scaling considerations](#scaling-considerations).
 
-Put your credentials in a `.env` file next to `compose.yaml`, and don't commit it:
+### Separate updater with Docker Compose
+
+To keep the data in a volume that survives container restarts, run geoipupdate as its own container and start the service binary directly (`entrypoint: ["/app"]`), bypassing the built-in updater. Put your credentials in a `.env` file next to `compose.yaml`, and don't commit it:
 
 ```
 MAXMIND_ACCOUNT_ID=YOUR_ACCOUNT_ID
 MAXMIND_LICENSE_KEY=YOUR_LICENSE_KEY
 ```
 
-`compose.yaml`:
+`compose.yaml` in the repository root:
 
 ```yaml
 services:
   geoipupdate:
-    image: ghcr.io/maxmind/geoipupdate:latest
+    image: ghcr.io/maxmind/geoipupdate:v8.0.0
     restart: unless-stopped
     environment:
       GEOIPUPDATE_ACCOUNT_ID: ${MAXMIND_ACCOUNT_ID}
@@ -132,9 +154,15 @@ services:
       retries: 60
 
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/app"]
     environment:
       DB_PATH: /usr/share/GeoIP/GeoLite2-Country.mmdb
+    ports:
+      - "8080:8080"
+      - "9090:9090"
     volumes:
       - geoip:/usr/share/GeoIP:ro
     depends_on:
@@ -149,102 +177,80 @@ volumes:
 docker compose up --build
 ```
 
-The `depends_on` condition holds the application back until the first download has finished, so it doesn't exit at startup because the file is missing. After that, geoipupdate refreshes the file every 24 hours and the application picks up each new version within a minute.
+The `depends_on` condition holds the service back until the first download has finished, so it doesn't exit at startup because the file is missing.
 
 ---
 
 ## Running in Kubernetes
 
-The recommended setup runs geoipupdate as a **sidecar** in each application pod. The two containers share an `emptyDir` volume, so no shared storage is needed.
+[deploy/k8s/deployment.yaml](../deploy/k8s/deployment.yaml) runs geoipupdate as a **sidecar** in each pod. The [README](../README.md#running-in-kubernetes) has the deployment steps; this section explains how the updates work.
 
-### 1. Create a Secret for the credentials
+- **geoipupdate is a [native sidecar](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/):** an init container with `restartPolicy: Always`. Kubernetes starts it first and only starts the app container once its `startupProbe` passes, meaning the first download has finished. It keeps running for the life of the pod and refreshes the data every 24 hours. Native sidecars require Kubernetes 1.29 or later.
+- **The two containers share an `emptyDir` volume** mounted at `/usr/share/GeoIP`, so no shared storage is needed. The app mounts it read-only.
+- **The app container runs `/app` directly** (`command: ["/app"]`), bypassing the image's built-in updater, because the sidecar already does that job.
+- **Credentials come from the `maxmind-credentials` Secret** in the `geoip-api` namespace. To create it outside the manifest:
 
-```sh
-kubectl create secret generic maxmind-credentials \
-  --from-literal=account-id=YOUR_ACCOUNT_ID \
-  --from-literal=license-key=YOUR_LICENSE_KEY
-```
+  ```sh
+  kubectl -n geoip-api create secret generic maxmind-credentials \
+    --from-literal=account-id=YOUR_ACCOUNT_ID \
+    --from-literal=license-key=YOUR_LICENSE_KEY
+  ```
 
-### 2. Deploy the application with the geoipupdate sidecar
-
-This uses a native sidecar (an init container with `restartPolicy: Always`), which requires Kubernetes 1.29 or later. Kubernetes starts the sidecar first and waits for its `startupProbe` to pass, meaning the first download has finished. Only then does it start the application container. The sidecar keeps running for the life of the pod and refreshes the database every 24 hours.
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: geoip-api
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: geoip-api
-  template:
-    metadata:
-      labels:
-        app: geoip-api
-    spec:
-      initContainers:
-        - name: geoipupdate
-          image: ghcr.io/maxmind/geoipupdate:latest
-          restartPolicy: Always          # native sidecar
-          env:
-            - name: GEOIPUPDATE_ACCOUNT_ID
-              valueFrom:
-                secretKeyRef: { name: maxmind-credentials, key: account-id }
-            - name: GEOIPUPDATE_LICENSE_KEY
-              valueFrom:
-                secretKeyRef: { name: maxmind-credentials, key: license-key }
-            - name: GEOIPUPDATE_EDITION_IDS
-              value: GeoLite2-Country
-            - name: GEOIPUPDATE_FREQUENCY
-              value: "24"
-          startupProbe:
-            exec:
-              command: ["test", "-f", "/usr/share/GeoIP/GeoLite2-Country.mmdb"]
-            periodSeconds: 5
-            failureThreshold: 60
-          volumeMounts:
-            - name: geoip
-              mountPath: /usr/share/GeoIP
-      containers:
-        - name: app
-          image: YOUR_REGISTRY/geoip-api:TAG
-          env:
-            - name: DB_PATH
-              value: /usr/share/GeoIP/GeoLite2-Country.mmdb
-          volumeMounts:
-            - name: geoip
-              mountPath: /usr/share/GeoIP
-              readOnly: true
-      volumes:
-        - name: geoip
-          emptyDir: {}
-```
-
-**On clusters older than 1.29**, use two containers instead:
-
-- **Init container:** a plain geoipupdate container without `GEOIPUPDATE_FREQUENCY`. It downloads once and exits before the application starts.
-- **Sidecar:** a second geoipupdate container under `containers` with `GEOIPUPDATE_FREQUENCY` set, to keep the file updated.
+**On clusters older than 1.29**, replace the native sidecar with two containers:
+- **Init container:** a plain geoipupdate container without `GEOIPUPDATE_FREQUENCY`. It downloads once and exits before the app starts.
+- **Updater:** a second geoipupdate container under `containers`, with `GEOIPUPDATE_FREQUENCY` set, to keep the file updated.
 
 This downloads the database twice each time a pod starts.
 
 ### Scaling considerations
 
-Each pod runs its own geoipupdate, so every replica counts against MaxMind's daily download limit. Pods also download again whenever they restart. If you run many replicas, switch to a single updater:
+Each pod runs its own geoipupdate, so every replica counts against MaxMind's daily download limit, and pods download again whenever they restart. That is fine for a handful of replicas. With many replicas, switch to a single updater:
 
 - A Kubernetes **CronJob** runs geoipupdate on a schedule and writes to a **ReadWriteMany** PersistentVolumeClaim, backed by network storage such as NFS, EFS or Azure Files.
-- Application pods mount the same claim read-only and point `DB_PATH` at it.
+- App pods mount the same claim read-only, point `DB_PATH` at it, and drop the sidecar.
 
-This results in one download per schedule, regardless of replica count. The application is safe on network storage because it reads the file into memory instead of memory-mapping it.
+This results in one download per schedule, regardless of replica count. The service is safe on network storage because it reads the file into memory instead of memory-mapping it.
 
 ---
+
+## Monitoring freshness
+
+Two signals show whether updates are reaching the service:
+
+- **Logs.** Every successful load is logged with the database's build date, so a new line should appear after each MaxMind release:
+
+  ```
+  Loaded database /usr/share/GeoIP/GeoLite2-Country.mmdb (built 2026-10-06T21:21:33Z)
+  ```
+
+  Reload failures are logged as `Error reloading database: ...`.
+
+- **`GET /health`** reports the build date of the data currently being served:
+
+  ```json
+  {"status": "ok", "database_build": "2026-10-06T21:21:33Z"}
+  ```
+
+Since MaxMind releases twice a week, alert if `database_build` is more than about 7 days old. That means updates have stopped, usually because of revoked credentials or the download limit.
+
+Stale data deliberately does **not** fail the health check. Every replica would go stale at the same moment, so failing the check would take the whole service down over a data-freshness problem.
+
+## Licence obligations
+
+The [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula) shapes how the data is handled:
+
+- **No redistribution.** The database can't be shared with third parties, which is why it isn't committed to this repository. Each environment downloads its own copy with its own license key. The tests use MaxMind's freely licensed [test database](https://github.com/maxmind/MaxMind-DB) instead.
+- **Delete old copies within 30 days of a new release.** geoipupdate replaces the file in place, and the service drops old copies from memory after a reload, so the setups above don't keep old versions. If you download manually, re-download regularly and don't keep old copies.
+- **Attribution.** Products using the data must credit MaxMind; see the README's Attribution section.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `Error loading database: ... no such file or directory` on startup | geoipupdate hasn't run yet, or `DB_PATH` doesn't match its output directory |
-| geoipupdate reports `401` / invalid license key | Wrong account ID or license key, or the key was revoked |
+| Service exits on startup with `loading database "..."` and a file-not-found error | The database hasn't been downloaded yet, or `DB_PATH` doesn't match where geoipupdate writes it |
+| Container exits immediately with `the AccountID option is required` | The image's built-in updater was started without `GEOIPUPDATE_ACCOUNT_ID` / `GEOIPUPDATE_LICENSE_KEY` |
+| geoipupdate reports `401` / `AUTHORIZATION_INVALID` | Wrong account ID or license key, or the key was revoked |
 | geoipupdate reports a download limit error | Too many updaters or restarts on one account; see [Scaling considerations](#scaling-considerations) |
-| `Error reloading database: ...` in the logs | A transient read failure during replacement. The application keeps serving the previous copy and retries on the next check |
+| Kubernetes pods stuck in `Init` | The sidecar can't download; check `kubectl -n geoip-api logs deploy/geoip-api -c geoipupdate` |
+| `Error reloading database: ...` in the logs | A transient read failure while the file was being replaced. The service keeps serving the previous copy and retries a minute later |
+| `database_build` in `/health` stops advancing | Updates have stopped; check the updater's logs for the errors above |

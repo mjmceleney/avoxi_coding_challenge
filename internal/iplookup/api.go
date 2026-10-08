@@ -1,7 +1,8 @@
 // Package iplookup checks whether an IP address belongs to one of a set of allowed
 // countries, using a MaxMind GeoLite2/GeoIP2 country database.
 //
-// It can be used directly from Go via Service, or exposed over HTTP via Service.Handler.
+// It can be used directly from Go via Service, or exposed over HTTP via Service.Handler
+// and gRPC via Service.GRPCServer.
 package iplookup
 
 import (
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,20 +24,30 @@ import (
 // database file.
 const DefaultReloadInterval = time.Minute
 
-var (
-	// ErrInvalidIP is returned when the given string is not a valid IPv4 or IPv6 address.
-	ErrInvalidIP = errors.New("invalid IP address")
-	// ErrNotLoaded is returned when no database has been loaded yet.
-	ErrNotLoaded = errors.New("database not loaded")
+// ErrInvalidArgument wraps every input validation failure, so callers can map them all to
+// a single client error (HTTP 400, gRPC INVALID_ARGUMENT).
+var ErrInvalidArgument = errors.New("invalid argument")
+
+// Reason explains why a Result is not allowed.
+type Reason string
+
+const (
+	// ReasonCountryNotAllowed means the IP resolved to a country outside the allowed list.
+	ReasonCountryNotAllowed Reason = "country_not_allowed"
+	// ReasonCountryUnknown means the database has no country for the IP (e.g. private or
+	// reserved ranges), so it can't be allowed.
+	ReasonCountryUnknown Reason = "country_unknown"
 )
 
 // Result is the outcome of a country check.
 type Result struct {
 	// Country is the ISO 3166-1 alpha-2 code the IP resolved to. It is empty if the
-	// database has no country for the IP (e.g. private or reserved ranges).
+	// database has no country for the IP.
 	Country string `json:"country"`
 	// Allowed reports whether Country is in the allowed list.
 	Allowed bool `json:"allowed"`
+	// Reason explains why the IP is not allowed. It is empty when Allowed is true.
+	Reason Reason `json:"reason,omitempty"`
 }
 
 // loadedDB is an in-memory copy of the database, along with the modification time of the
@@ -68,39 +80,16 @@ func New(dbPath string) (*Service, error) {
 // Check looks up the country for ip and reports whether it is in allowedCountries
 // (ISO 3166-1 alpha-2 codes, compared case-insensitively).
 //
-// An IP from a disallowed country is not an error: it returns a Result with Allowed set
-// to false. Errors are reserved for invalid input or lookup failures.
+// An IP that isn't allowed is not an error: it returns a Result with Allowed set to false
+// and a Reason. Errors are reserved for invalid input (wrapping ErrInvalidArgument) or
+// lookup failures.
 func (s *Service) Check(ip string, allowedCountries []string) (Result, error) {
-	country, err := s.Country(ip)
-	if err != nil {
-		return Result{}, err
+	addr := net.ParseIP(strings.TrimSpace(ip))
+	if addr == nil {
+		return Result{}, fmt.Errorf("%w: invalid IP address %q", ErrInvalidArgument, ip)
 	}
-
-	res := Result{Country: country}
-	if country == "" {
-		return res, nil
-	}
-	for _, c := range allowedCountries {
-		if strings.EqualFold(strings.TrimSpace(c), country) {
-			res.Allowed = true
-			break
-		}
-	}
-	return res, nil
-}
-
-// Country returns the ISO 3166-1 alpha-2 country code for ip, or "" if the database has
-// no country for it.
-func (s *Service) Country(ip string) (string, error) {
-	// Ensure valid IP address has been passed
-	ipAddr := net.ParseIP(strings.TrimSpace(ip))
-	if ipAddr == nil {
-		return "", fmt.Errorf("%w: %q", ErrInvalidIP, ip)
-	}
-
-	loaded := s.current.Load()
-	if loaded == nil {
-		return "", ErrNotLoaded
+	if len(allowedCountries) == 0 {
+		return Result{}, fmt.Errorf("%w: allowed_countries must not be empty", ErrInvalidArgument)
 	}
 
 	var record struct {
@@ -108,10 +97,21 @@ func (s *Service) Country(ip string) (string, error) {
 			IsoCode string `maxminddb:"iso_code"`
 		} `maxminddb:"country"`
 	}
-	if err := loaded.reader.Lookup(ipAddr, &record); err != nil {
-		return "", fmt.Errorf("looking up %s: %w", ipAddr, err)
+	// Current is guaranteed to be a valid pointer, so we don't need any additional nil checks.
+	if err := s.current.Load().reader.Lookup(addr, &record); err != nil {
+		return Result{}, fmt.Errorf("looking up %s: %w", addr, err)
 	}
-	return record.Country.IsoCode, nil
+
+	country := record.Country.IsoCode
+	if country == "" {
+		return Result{Reason: ReasonCountryUnknown}, nil
+	}
+	if !slices.ContainsFunc(allowedCountries, func(c string) bool {
+		return strings.EqualFold(strings.TrimSpace(c), country)
+	}) {
+		return Result{Country: country, Reason: ReasonCountryNotAllowed}, nil
+	}
+	return Result{Country: country, Allowed: true}, nil
 }
 
 // Reload reads the database file into memory and makes it the current database, unless
@@ -141,7 +141,14 @@ func (s *Service) Reload() error {
 	// The previous reader is not closed: in-flight lookups may still be using it, and
 	// since it isn't memory-mapped the garbage collector frees it once they finish.
 	s.current.Store(&loadedDB{reader: reader, modTime: info.ModTime()})
+	log.Printf("Loaded database %s (built %s)", s.dbPath, s.DatabaseBuild().Format(time.RFC3339))
 	return nil
+}
+
+// DatabaseBuild returns when MaxMind built the currently loaded database, which shows how
+// fresh the data is.
+func (s *Service) DatabaseBuild() time.Time {
+	return time.Unix(int64(s.current.Load().reader.Metadata.BuildEpoch), 0).UTC()
 }
 
 // Watch reloads the database whenever its modification time changes, until ctx is

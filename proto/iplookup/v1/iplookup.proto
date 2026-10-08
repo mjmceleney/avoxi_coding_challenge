@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package iplookup.v1;
+
+option go_package = "iplookup/gen/iplookup/v1;iplookupv1";
+
+// IPLookupService checks IP addresses against a list of allowed countries.
+service IPLookupService {
+  // Check resolves the country of an IP address and reports whether it is allowed.
+  //
+  // Returns INVALID_ARGUMENT if the IP is malformed or allowed_countries is empty.
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {
+  // IPv4 or IPv6 address to look up.
+  string ip = 1;
+  // ISO 3166-1 alpha-2 country codes, compared case-insensitively.
+  repeated string allowed_countries = 2;
+}
+
+message CheckResponse {
+  // Country the IP resolved to. Empty if the database has no country for the IP
+  // (e.g. private or reserved ranges).
+  string country = 1;
+  // Whether country is in allowed_countries.
+  bool allowed = 2;
+  // Why the IP is not allowed. REASON_UNSPECIFIED when allowed is true.
+  Reason reason = 3;
+}
+
+// Reason explains why a CheckResponse is not allowed.
+enum Reason {
+  // No reason: the IP is allowed.
+  REASON_UNSPECIFIED = 0;
+  // The IP resolved to a country outside allowed_countries.
+  REASON_COUNTRY_NOT_ALLOWED = 1;
+  // The database has no country for the IP (e.g. private or reserved ranges), so it
+  // can't be allowed.
+  REASON_COUNTRY_UNKNOWN = 2;
+}
