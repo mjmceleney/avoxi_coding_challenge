@@ -30,6 +30,8 @@ spec:
       labels:
         app: geoip-api
     spec:
+      # Must cover the app's preStop pause (5s) plus its shutdown drain (10s).
+      terminationGracePeriodSeconds: 30
       initContainers:
         - name: geoipupdate
           image: ghcr.io/maxmind/geoipupdate:v8.0.0
@@ -47,6 +49,8 @@ spec:
                   key: license-key
             - name: GEOIPUPDATE_EDITION_IDS
               value: GeoLite2-Country
+            # Must stay non-zero: at 0 geoipupdate downloads once and exits, and Kubernetes
+            # restarts an exited native sidecar, so it would download over and over.
             - name: GEOIPUPDATE_FREQUENCY
               value: "24"
           startupProbe:
@@ -78,6 +82,14 @@ spec:
               value: ":8080"
             - name: GRPC_ADDR
               value: ":9090"
+          lifecycle:
+            # Kubernetes removes a terminating pod from the Service endpoints at the same
+            # time as it sends SIGTERM, and other nodes take a moment to notice. Pausing
+            # before SIGTERM keeps the pod serving the requests still routed to it; the
+            # app then drains in-flight requests as it shuts down.
+            preStop:
+              exec:
+                command: ["sleep", "5"]
           livenessProbe:
             httpGet:
               path: /health

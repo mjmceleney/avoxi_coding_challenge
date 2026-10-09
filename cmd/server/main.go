@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -20,9 +20,31 @@ import (
 const shutdownTimeout = 10 * time.Second
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
+	// Logs are JSON on stderr, so log collectors can parse and query their fields.
+	level, levelErr := logLevel()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if levelErr != nil {
+		slog.Warn("invalid LOG_LEVEL, using info", "error", levelErr)
 	}
+
+	if err := run(); err != nil {
+		slog.Error("server stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+// logLevel reads the minimum log level from LOG_LEVEL (debug, info, warn or error),
+// defaulting to info.
+func logLevel() (slog.Level, error) {
+	env := os.Getenv("LOG_LEVEL")
+	if env == "" {
+		return slog.LevelInfo, nil
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(env)); err != nil {
+		return slog.LevelInfo, err
+	}
+	return level, nil
 }
 
 // run starts the HTTP and gRPC servers and blocks until a shutdown signal is received or
@@ -77,13 +99,13 @@ func run() error {
 	// Buffered so a server that fails after shutdown has begun doesn't block forever.
 	serveErr := make(chan error, 2)
 	go func() {
-		log.Printf("HTTP listening on %s (database: %s)", addr, dbPath)
+		slog.Info("HTTP server listening", "addr", addr)
 		if err := srv.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- fmt.Errorf("HTTP server: %w", err)
 		}
 	}()
 	go func() {
-		log.Printf("gRPC listening on %s", grpcAddr)
+		slog.Info("gRPC server listening", "addr", grpcAddr)
 		if err := grpcSrv.Serve(grpcLis); err != nil {
 			serveErr <- fmt.Errorf("gRPC server: %w", err)
 		}
@@ -93,9 +115,9 @@ func run() error {
 	var runErr error
 	select {
 	case <-ctx.Done():
-		log.Println("Shutdown signal received, draining connections")
+		slog.Info("shutdown signal received, draining connections")
 	case runErr = <-serveErr:
-		log.Println("Shutting down after server error:", runErr)
+		slog.Error("server failed, shutting down", "error", runErr)
 	}
 	stop() // restore default signal handling, so a second Ctrl+C kills immediately
 
@@ -110,16 +132,16 @@ func run() error {
 		close(grpcStopped)
 	}()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Println("HTTP shutdown incomplete, closing remaining connections:", err)
+		slog.Warn("HTTP shutdown incomplete, closing remaining connections", "error", err)
 		srv.Close()
 	}
 	select {
 	case <-grpcStopped:
 	case <-shutdownCtx.Done():
-		log.Println("gRPC shutdown incomplete, closing remaining connections")
+		slog.Warn("gRPC shutdown incomplete, closing remaining connections")
 		grpcSrv.Stop()
 	}
 
-	log.Println("Shutdown complete")
+	slog.Info("shutdown complete")
 	return runErr
 }

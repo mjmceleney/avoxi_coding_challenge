@@ -9,7 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"slices"
@@ -83,6 +83,11 @@ func New(dbPath string) (*Service, error) {
 // An IP that isn't allowed is not an error: it returns a Result with Allowed set to false
 // and a Reason. Errors are reserved for invalid input (wrapping ErrInvalidArgument) or
 // lookup failures.
+//
+// Entries in allowedCountries that aren't valid country codes (such as "USA" or "UK") are
+// logged as errors and ignored, rather than failing the whole check. A typo in a
+// customer's list then only blocks logins from the country it was meant to allow, and the
+// error log shows what needs fixing.
 func (s *Service) Check(ip string, allowedCountries []string) (Result, error) {
 	addr := net.ParseIP(strings.TrimSpace(ip))
 	if addr == nil {
@@ -90,6 +95,10 @@ func (s *Service) Check(ip string, allowedCountries []string) (Result, error) {
 	}
 	if len(allowedCountries) == 0 {
 		return Result{}, fmt.Errorf("%w: allowed_countries must not be empty", ErrInvalidArgument)
+	}
+	countries, invalid := validCountryCodes(allowedCountries)
+	if len(invalid) > 0 {
+		slog.Error("ignoring invalid country codes in allowed_countries", "invalid", invalid)
 	}
 
 	var record struct {
@@ -106,9 +115,7 @@ func (s *Service) Check(ip string, allowedCountries []string) (Result, error) {
 	if country == "" {
 		return Result{Reason: ReasonCountryUnknown}, nil
 	}
-	if !slices.ContainsFunc(allowedCountries, func(c string) bool {
-		return strings.EqualFold(strings.TrimSpace(c), country)
-	}) {
+	if !slices.Contains(countries, country) {
 		return Result{Country: country, Reason: ReasonCountryNotAllowed}, nil
 	}
 	return Result{Country: country, Allowed: true}, nil
@@ -141,7 +148,7 @@ func (s *Service) Reload() error {
 	// The previous reader is not closed: in-flight lookups may still be using it, and
 	// since it isn't memory-mapped the garbage collector frees it once they finish.
 	s.current.Store(&loadedDB{reader: reader, modTime: info.ModTime()})
-	log.Printf("Loaded database %s (built %s)", s.dbPath, s.DatabaseBuild().Format(time.RFC3339))
+	slog.Info("loaded database", "path", s.dbPath, "built", s.DatabaseBuild())
 	return nil
 }
 
@@ -163,8 +170,7 @@ func (s *Service) Watch(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			if err := s.Reload(); err != nil {
-				// Keep serving the previously loaded database
-				log.Println("Error reloading database:", err)
+				slog.Warn("reloading database failed, still serving the previous copy", "path", s.dbPath, "error", err)
 			}
 		}
 	}

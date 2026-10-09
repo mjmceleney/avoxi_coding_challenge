@@ -42,7 +42,7 @@ MaxMind limits how many databases an account can download per day. Every running
 | `AccountID` / `GEOIPUPDATE_ACCOUNT_ID` | geoipupdate | MaxMind account ID |
 | `LicenseKey` / `GEOIPUPDATE_LICENSE_KEY` | geoipupdate | MaxMind license key |
 | `EditionIDs` / `GEOIPUPDATE_EDITION_IDS` | geoipupdate | Always `GeoLite2-Country` |
-| `GEOIPUPDATE_FREQUENCY` | geoipupdate (Docker images) | Hours between updates. If unset, it runs once and exits |
+| `GEOIPUPDATE_FREQUENCY` | geoipupdate (Docker images) | Hours between updates. `0` (or unset, in MaxMind's image) means download once and stop; see [Disabling refreshes](#disabling-refreshes) |
 | `GEOIPUPDATE_DB_DIR` | geoipupdate (Docker images) | Output directory (default `/usr/share/GeoIP`) |
 
 The left-hand names are for the geoipupdate CLI's config file; the `GEOIPUPDATE_*` names are environment variables.
@@ -109,7 +109,7 @@ Re-run the download command whenever you want fresh data. To automate it, schedu
 The image built from [deploy/Dockerfile](../deploy/Dockerfile) is based on MaxMind's geoipupdate image, and its entrypoint keeps the database current by itself:
 
 1. On startup, it runs geoipupdate once. If that fails (for example, because of bad credentials), the container exits rather than starting without data.
-2. It starts a background loop that runs geoipupdate every `GEOIPUPDATE_FREQUENCY` hours (default 24). Failures are logged and retried on the next cycle, and the service keeps serving the data it has.
+2. It starts a background loop that runs geoipupdate every `GEOIPUPDATE_FREQUENCY` hours (default 24). Failures are logged and retried on the next cycle, and the service keeps serving the data it has. If `GEOIPUPDATE_FREQUENCY` is `0`, no loop is started (see [Disabling refreshes](#disabling-refreshes)). If it isn't a whole number, the container exits with an error rather than guessing.
 3. It starts the service, which reads from `/usr/share/GeoIP/GeoLite2-Country.mmdb`.
 
 Credentials are supplied at runtime, never baked into the image:
@@ -123,6 +123,19 @@ docker run -d --rm --name avoxi -p 8080:8080 -p 9090:9090 \
 ```
 
 The data lives inside the container, so each new container downloads it again on startup. That's fine for a single long-running container; for many containers, see [Scaling considerations](#scaling-considerations).
+
+### Disabling refreshes
+
+Set `GEOIPUPDATE_FREQUENCY=0` to download the database once at startup and never refresh it while the container runs. The log says so at startup:
+
+```
+GEOIPUPDATE_FREQUENCY is 0: the database will not be refreshed until the container restarts
+```
+
+This suits short-lived containers, or environments that refresh by redeploying. Two things to keep in mind:
+
+- **Licence:** MaxMind requires old copies to be deleted within 30 days of a new release, so a container with refreshes disabled must be restarted (and so re-download) at least that often.
+- **Kubernetes:** this applies to the image's built-in updater only. The Kubernetes sidecar must keep a non-zero frequency. At `0` geoipupdate exits after one download, and Kubernetes restarts an exited native sidecar, so it would download repeatedly and exhaust the daily download limit.
 
 ### Separate updater with Docker Compose
 
@@ -220,10 +233,10 @@ Two signals show whether updates are reaching the service:
 - **Logs.** Every successful load is logged with the database's build date, so a new line should appear after each MaxMind release:
 
   ```
-  Loaded database /usr/share/GeoIP/GeoLite2-Country.mmdb (built 2026-10-06T21:21:33Z)
+  {"time":"…","level":"INFO","msg":"loaded database","path":"/usr/share/GeoIP/GeoLite2-Country.mmdb","built":"2026-10-06T21:21:33Z"}
   ```
 
-  Reload failures are logged as `Error reloading database: ...`.
+  Reload failures are logged at `WARN` with the message `reloading database failed, still serving the previous copy`.
 
 - **`GET /health`** reports the build date of the data currently being served:
 
@@ -240,7 +253,7 @@ Stale data deliberately does **not** fail the health check. Every replica would 
 The [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula) shapes how the data is handled:
 
 - **No redistribution.** The database can't be shared with third parties, which is why it isn't committed to this repository. Each environment downloads its own copy with its own license key. The tests use MaxMind's freely licensed [test database](https://github.com/maxmind/MaxMind-DB) instead.
-- **Delete old copies within 30 days of a new release.** geoipupdate replaces the file in place, and the service drops old copies from memory after a reload, so the setups above don't keep old versions. If you download manually, re-download regularly and don't keep old copies.
+- **Delete old copies within 30 days of a new release.** geoipupdate replaces the file in place, and the service drops old copies from memory after a reload, so the setups above don't keep old versions. If you download manually, or run with refreshes disabled, re-download at least every 30 days and don't keep old copies.
 - **Attribution.** Products using the data must credit MaxMind; see the README's Attribution section.
 
 ## Troubleshooting
@@ -252,5 +265,5 @@ The [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula) shapes how the data
 | geoipupdate reports `401` / `AUTHORIZATION_INVALID` | Wrong account ID or license key, or the key was revoked |
 | geoipupdate reports a download limit error | Too many updaters or restarts on one account; see [Scaling considerations](#scaling-considerations) |
 | Kubernetes pods stuck in `Init` | The sidecar can't download; check `kubectl -n geoip-api logs deploy/geoip-api -c geoipupdate` |
-| `Error reloading database: ...` in the logs | A transient read failure while the file was being replaced. The service keeps serving the previous copy and retries a minute later |
+| `reloading database failed` warnings in the logs | A transient read failure while the file was being replaced. The service keeps serving the previous copy and retries a minute later |
 | `database_build` in `/health` stops advancing | Updates have stopped; check the updater's logs for the errors above |

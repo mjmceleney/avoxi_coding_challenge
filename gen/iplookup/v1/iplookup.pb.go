@@ -79,7 +79,8 @@ type CheckRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// IPv4 or IPv6 address to look up.
 	Ip string `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
-	// ISO 3166-1 alpha-2 country codes, compared case-insensitively.
+	// ISO 3166-1 alpha-2 country codes, compared case-insensitively. Entries that aren't
+	// valid codes are ignored and logged as errors, rather than failing the request.
 	AllowedCountries []string `protobuf:"bytes,2,rep,name=allowed_countries,json=allowedCountries,proto3" json:"allowed_countries,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache

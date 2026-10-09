@@ -15,6 +15,7 @@ curl -X POST http://localhost:8080/v1/check \
 - [HTTP API](#http-api)
 - [gRPC API](#grpc-api)
 - [Behaviour](#behaviour)
+- [Extensions](#extensions)
 - [Keeping the data up to date](#keeping-the-data-up-to-date)
 - [Configuration](#configuration)
 - [Development](#development)
@@ -54,9 +55,9 @@ go run ./cmd/server
 ```
 
 ```
-Loaded database data/GeoLite2-Country.mmdb (built 2026-10-06T21:21:33Z)
-gRPC listening on :9090
-HTTP listening on :8080 (database: data/GeoLite2-Country.mmdb)
+{"time":"…","level":"INFO","msg":"loaded database","path":"data/GeoLite2-Country.mmdb","built":"2026-10-06T21:21:33Z"}
+{"time":"…","level":"INFO","msg":"gRPC server listening","addr":":9090"}
+{"time":"…","level":"INFO","msg":"HTTP server listening","addr":":8080"}
 ```
 
 In another terminal:
@@ -167,7 +168,7 @@ Request:
 | Field | Description |
 |---|---|
 | `ip` | IPv4 or IPv6 address |
-| `allowed_countries` | Non-empty list of [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) codes, compared case-insensitively |
+| `allowed_countries` | Non-empty list of [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) codes, compared case-insensitively. Entries that aren't valid codes (e.g. `"USA"`, or `"UK"` instead of `"GB"`) are ignored and logged as errors, rather than failing the request |
 
 Responses (`200 OK`):
 
@@ -223,7 +224,7 @@ grpcurl omits fields at their default value, so a denied unknown-country respons
 If grpcurl isn't installed, you can run it with Docker Desktop:
 
 ```bash
-docker run --rm fullstorydev/grpcurl -plaintext host.docker.internal:9090 list
+docker run --rm fullstorydev/grpcurl:v1.9.3 -plaintext host.docker.internal:9090 list
 ```
 
 The standard [gRPC health service](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) (`grpc.health.v1.Health`) reports `SERVING` while the server is running.
@@ -233,7 +234,67 @@ The standard [gRPC health service](https://github.com/grpc/grpc/blob/master/doc/
 - **IPv4 and IPv6** are both supported, including IPv4-mapped IPv6 (`::ffff:8.8.8.8`).
 - **Unknown countries are denied.** Private and reserved ranges, and the roughly 2,000 networks MaxMind can't place in a country, return `country_unknown`.
 - **Only the IP's actual location is used.** MaxMind also records a `registered_country`, which is where the network's owner registered it. That is often not where the user is (for example, Cloudflare's `1.1.1.0/24` is registered in Australia), so it is deliberately not used as a fallback.
+- **Invalid country codes are ignored, not rejected.** One bad entry in a customer's list (such as `"UK"`) shouldn't lock out users from that customer's valid countries. Each request with invalid entries logs an error naming them, so the configuration can be fixed.
+- **Logs are structured JSON** on stderr: one line per request (method, path or RPC, status, duration), plus database loads, reload failures and errors. End users' IP addresses are never logged.
 - **VPNs and proxies are not detected.** This is out of scope for phase one; the service checks the presented IP only.
+
+## Extensions
+
+Beyond the core requirement and the listed bonus items (keeping the data updated, Docker, Kubernetes and gRPC), I added the following. Each entry is the case I'd make for it in a design meeting.
+
+### Reasons for denials
+
+**What:** a denied result includes a `reason`: `country_not_allowed`, or `country_unknown` when the IP's location can't be determined (`REASON_*` enum values in gRPC).
+
+**Why:** a bare `allowed: false` covers two very different situations. "You're logging in from a country your company doesn't allow" is a policy working as intended. "We couldn't tell where you are" is usually a private network or an unusual address, and the user's IT team can likely fix it. When a customer's employee is locked out and calls support, the reason in the gateway's logs turns a support investigation into a lookup. It costs one optional field, and an allowed response is unchanged.
+
+### Tolerating mistakes in customer country lists
+
+**What:** entries in `allowed_countries` are checked against the real ISO 3166-1 list. Invalid ones, such as `"USA"` or `"UK"` (instead of `"GB"`), are ignored and logged as errors naming the bad values. The rest of the list still applies.
+
+**Why:** If a correctly passed ID is valid, we do not want to cause a failure, when we could properly treat it as a success. The error will still be logged if a user is seeing unexpected denials.
+
+### Zero-downtime data reloads
+
+**What:** when geoipupdate replaces the database file, the service loads the new copy and swaps it in atomically, without a restart. Lookups never wait on a lock, in-flight lookups finish on the old copy, and a failed reload keeps the last good data in service.
+
+**Why:** MaxMind publishes updates twice a week. Picking them up by restarting would mean a rolling restart of every replica twice a week, with each pod downloading again. Reloading in place costs about 40 lines, makes updates invisible to callers, and turns a bad download into a logged warning instead of an outage.
+
+### Data freshness reporting
+
+**What:** `GET /health` reports `database_build`, the date MaxMind built the data being served, and every load is logged with the same date.
+
+**Why:** the most likely long-term failure is quiet: the license key gets revoked or a download limit is hit, updates stop, and the service keeps answering from data that gets older every week. Nothing errors. Exposing the build date lets monitoring alert when it stops advancing (around 7 days without an update). The service deliberately doesn't fail its health check on old data: every replica would go stale at once, and a data-freshness problem would become a full outage.
+
+### Structured logging
+
+**What:** JSON logs via `log/slog`:
+- one line per HTTP request and gRPC call, with the method, status and duration
+- separate entries for database loads, reload failures, lookup errors and invalid country codes
+- level set by `LOG_LEVEL`, with health checks at debug level so Kubernetes probes don't flood the logs
+
+**Why:** this service sits on every login path, so when logins fail the first question is whether it was the cause. Structured fields can be queried and alerted on directly (`status`, `duration_ms`, `invalid`), with no text parsing. End users' IP addresses are deliberately not logged, which keeps personal data out of the logs.
+
+### Graceful shutdown
+
+**What:** in Kubernetes, a terminating pod first pauses for 5 seconds (a `preStop` hook) while it is taken out of the Service's rotation, so requests still being routed to it are served. Then, on SIGTERM, the HTTP and gRPC servers stop accepting connections and finish in-flight requests, with a shared 10-second deadline, before the process exits.
+
+**Why:** Kubernetes sends SIGTERM on every deployment, scale-down and node drain. Without draining, each rollout fails whatever login checks are in flight at that moment, plus any that arrive before the rest of the cluster stops routing to the pod: a small but certain error rate on every release. It's about 30 lines in `main` and one hook in the manifest.
+
+### Health checks and gRPC reflection
+
+**What:**
+- `GET /health` for the Kubernetes probes
+- the standard `grpc.health.v1` service for gRPC-aware load balancers
+- server reflection, so tools like `grpcurl` and Postman can call the API without the `.proto` file
+
+**Why:** health checks let Kubernetes hold traffic until a pod is serving and replace a stuck one, which is what makes rolling deployments safe. Reflection makes the gRPC API as easy to debug as `curl` makes the HTTP one. Both are a few lines each and use standard protocols, so existing tooling works unchanged.
+
+### Considered and deferred
+
+- **`registered_country` fallback.** For the roughly 2,000 networks with no location, MaxMind also records where the network's owner registered it. That isn't where the user is (Cloudflare's `1.1.1.0/24` is registered in Australia), so for a security control I chose to deny rather than guess.
+- **Metrics (Prometheus).** These would be the natural next step after logging: request rates by outcome and reason, latency, and data age as a gauge. Deferred because the logs already carry the same signals for a service at this stage.
+- **VPN and proxy detection.** Out of scope for phase one, per the requirements. It needs a separate data source, such as MaxMind's anonymous IP database, and the `reason` field leaves room for a `vpn_detected` value.
 
 ## Keeping the data up to date
 
@@ -251,10 +312,11 @@ Environment variables:
 |---|---|---|
 | `ADDR` | `:8080` | HTTP listen address |
 | `GRPC_ADDR` | `:9090` | gRPC listen address |
+| `LOG_LEVEL` | `info` | Minimum log level: `debug`, `info`, `warn` or `error`. Health-check requests are logged at `debug` |
 | `DB_PATH` | `data/GeoLite2-Country.mmdb` (`/usr/share/GeoIP/GeoLite2-Country.mmdb` in the image) | Path to the database |
 | `GEOIPUPDATE_ACCOUNT_ID` | | MaxMind account ID (Docker image only) |
 | `GEOIPUPDATE_LICENSE_KEY` | | MaxMind license key (Docker image only) |
-| `GEOIPUPDATE_FREQUENCY` | `24` | Hours between database refreshes (Docker image only) |
+| `GEOIPUPDATE_FREQUENCY` | `24` | Hours between database refreshes (Docker image only). `0` downloads once at startup and never refreshes; see the [update guide](docs/geoip-database-updates.md#disabling-refreshes) |
 
 If you change `ADDR` or `GRPC_ADDR` in Docker, change the container side of the matching `-p` too.
 
@@ -284,7 +346,7 @@ After editing the `.proto`, regenerate `gen/` with [buf](https://buf.build/docs/
 ```bash
 buf lint && buf generate
 # or, without installing buf:
-docker run --rm -v "$(pwd):/workspace" -w /workspace bufbuild/buf generate
+docker run --rm -v "$(pwd):/workspace" -w /workspace bufbuild/buf:1.73.0 generate
 ```
 
 ## AI usage

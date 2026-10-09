@@ -15,7 +15,8 @@ service IPLookupService {
 message CheckRequest {
   // IPv4 or IPv6 address to look up.
   string ip = 1;
-  // ISO 3166-1 alpha-2 country codes, compared case-insensitively.
+  // ISO 3166-1 alpha-2 country codes, compared case-insensitively. Entries that aren't
+  // valid codes are ignored and logged as errors, rather than failing the request.
   repeated string allowed_countries = 2;
 }
 

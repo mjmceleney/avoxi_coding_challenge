@@ -52,6 +52,8 @@ internal/iplookup/
   api.go                    Service: Check, Reload, Watch, DatabaseBuild; Result and Reason types
   http.go                   HTTP adapter: routes, JSON encoding, error-to-status mapping
   grpc.go                   gRPC adapter: generated-interface implementation, health, reflection
+  countries.go              the set of valid country codes, and allowed-list validation
+  logging.go                request logging: HTTP middleware and gRPC interceptor
   testdata/                 MaxMind's test database
 proto/iplookup/v1/          gRPC contract (source of truth for gen/)
 gen/iplookup/v1/            generated Go code (committed, regenerated with buf)
@@ -94,11 +96,12 @@ flowchart TD
     B -- no --> E1[/"ErrInvalidArgument"/]
     B -- yes --> C{"allowedCountries<br/>non-empty?"}
     C -- no --> E1
-    C -- yes --> D["reader.Lookup(ip)<br/>decode country.iso_code"]
+    C -- yes --> V["validate codes<br/>(log and drop invalid entries)"]
+    V --> D["reader.Lookup(ip)<br/>decode country.iso_code"]
     D -- error --> E2[/"lookup error<br/>(server fault)"/]
     D -- ok --> F{"country found?"}
     F -- no --> R1["{country: '', allowed: false,<br/>reason: country_unknown}"]
-    F -- yes --> G{"in allowedCountries?<br/>(trimmed, case-insensitive)"}
+    F -- yes --> G{"in the valid codes?<br/>(trimmed, case-insensitive)"}
     G -- no --> R2["{country: XX, allowed: false,<br/>reason: country_not_allowed}"]
     G -- yes --> R3["{country: XX, allowed: true}"]
 ```
@@ -107,6 +110,7 @@ Points to note:
 
 - **A denial is a result, not an error.** Errors mean no decision could be made: either the input was invalid, or the lookup itself failed.
 - **"Not found" is not a lookup error.** The MaxMind reader returns no error for addresses it has no data for (private and reserved ranges, or the roughly 2,000 networks MaxMind can't place). The record decodes empty, and `Check` returns `country_unknown`.
+- **Invalid entries in the allowed list are ignored, not rejected.** Each entry is trimmed, upper-cased and checked against the 249 ISO 3166-1 codes plus `XK` (Kosovo, which MaxMind uses). Invalid entries are dropped and logged as one error per request. A typo such as `"UK"` then only blocks the country it was meant to allow, rather than failing every login for that customer. If every entry is invalid, nothing can match and the result is `country_not_allowed`.
 - **Only `country` is decoded.** The record also has `registered_country`, where the network's owner registered it, which is often not where the user is. It is deliberately not used as a fallback (see [section 10](#10-design-decisions)).
 - **Lookups are cheap:** about 330 ns and zero heap allocations each, measured against the full GeoLite2-Country database. The service is not CPU-bound at any realistic gateway load.
 
@@ -132,7 +136,7 @@ The reader queries this structure directly from memory with no up-front decoding
 1. `stat` the file. If its modification time equals the loaded copy's, return; nothing changed.
 2. Read the whole file into a byte slice and open it with `maxminddb.FromBytes`, which validates the metadata.
 3. Store a new `loadedDB` in `current` with a single atomic pointer write.
-4. Log `Loaded database <path> (built <build date>)`.
+4. Log `loaded database` with the path and build date.
 
 If any step fails, `current` is left untouched and the error is returned. `New` turns that into a startup failure; `Watch` logs it and tries again on the next tick.
 
@@ -190,7 +194,7 @@ Client errors return a descriptive message and aren't logged, since they're the 
 | Input | Rule |
 |---|---|
 | `ip` | Must parse as IPv4 or IPv6 after trimming whitespace |
-| `allowed_countries` | Must be non-empty. Entries are trimmed and compared case-insensitively. Their format is not yet validated, so a malformed code (e.g. `"USA"`) never matches rather than being rejected (see [section 11](#11-known-limitations-and-future-work)) |
+| `allowed_countries` | Must be non-empty. Entries are trimmed and compared case-insensitively. Entries that aren't valid country codes are ignored and logged as an error (see [section 4.2](#42-checkip-allowedcountries)) |
 
 ## 6. Process lifecycle
 
@@ -203,6 +207,7 @@ All configuration comes from environment variables, with defaults suited to loca
 | `DB_PATH` | `data/GeoLite2-Country.mmdb` |
 | `ADDR` | `:8080` (HTTP) |
 | `GRPC_ADDR` | `:9090` (gRPC) |
+| `LOG_LEVEL` | `info` (also `debug`, `warn`, `error`) |
 
 ### 6.2 Startup
 
@@ -246,7 +251,7 @@ Points to note:
 | `ReadTimeout` | 10 s | Limit slow body delivery, which `ReadHeaderTimeout` doesn't cover |
 | `IdleTimeout` | 2 min | Keep the gateway's pooled keep-alive connections. Without it, Go falls back to `ReadTimeout`, which would drop them after 10 s idle |
 | `WriteTimeout` | none | Responses are tiny and the handler takes microseconds, so there is nothing to protect |
-| Shutdown drain | 10 s | Within Kubernetes' default 30 s termination grace period |
+| Shutdown drain | 10 s | Plus the 5 s `preStop` pause (section 9.2), within the pod's 30 s termination grace period |
 
 ## 7. Data management
 
@@ -263,19 +268,28 @@ The [GeoIP database updates](geoip-database-updates.md) guide covers setup and o
 
 ### 8.1 Logs
 
-Logs are plain text on stderr, written with Go's standard `log` package.
+Logs are structured JSON on stderr, written with Go's `log/slog`, so log collectors can parse and query their fields. `LOG_LEVEL` sets the minimum level.
+
+```json
+{"time":"2026-10-08T22:17:17.07Z","level":"ERROR","msg":"ignoring invalid country codes in allowed_countries","invalid":["USA"]}
+{"time":"2026-10-08T22:17:17.07Z","level":"INFO","msg":"http request","method":"POST","path":"/v1/check","status":200,"duration_ms":0.961}
+```
 
 | Message | Level of concern | Meaning |
 |---|---|---|
-| `Loaded database <path> (built <date>)` | Info | Startup load or successful refresh |
-| `HTTP listening on ...` / `gRPC listening on ...` | Info | Servers started |
-| `Error reloading database: ...` | Warning | Refresh failed; previous data still in use |
-| `Error checking IP: ...` | Error | A lookup failed; the caller got `500` / `INTERNAL` |
-| `Error writing response: ...` | Warning | The client disconnected mid-response |
-| `Shutdown signal received...` / `Shutdown complete` | Info | Graceful shutdown |
-| `Shutting down after server error: ...` | Error | A server failed; the process will exit non-zero |
+| `loaded database` (`path`, `built`) | Info | Startup load or successful refresh |
+| `HTTP server listening` / `gRPC server listening` (`addr`) | Info | Servers started |
+| `http request` (`method`, `path`, `status`, `duration_ms`) | Info; Debug for `/health` | One line per HTTP request |
+| `grpc request` (`method`, `code`, `duration_ms`) | Info; Debug for health checks | One line per unary gRPC call |
+| `ignoring invalid country codes in allowed_countries` (`invalid`) | Error | A customer's allowed list contains bad entries that need fixing |
+| `reloading database failed, still serving the previous copy` (`path`, `error`) | Warn | Refresh failed; previous data still in use |
+| `lookup failed` (`error`) | Error | A lookup failed; the caller got `500` / `INTERNAL` |
+| `writing response failed` (`error`) | Warn | The client disconnected mid-response |
+| `shutdown signal received, draining connections` / `shutdown complete` | Info | Graceful shutdown |
+| `server failed, shutting down` / `server stopped` (`error`) | Error | A server failed, or startup failed; the process exits non-zero |
+| `invalid LOG_LEVEL, using info` | Warn | `LOG_LEVEL` couldn't be parsed |
 
-Successful checks aren't logged, so per-request IPs, which are personal data, don't end up in the logs.
+Request logs record the method, outcome and duration, but not request bodies, so end users' IP addresses (personal data) never reach the logs. Health checks log at debug level, so Kubernetes probes don't flood the logs.
 
 ### 8.2 Health and alerting
 
@@ -294,10 +308,10 @@ Stale data is surfaced through `database_build` rather than by failing the healt
 
 [deploy/Dockerfile](../deploy/Dockerfile) is a two-stage build:
 
-1. **Build stage:** `golang:1.27` compiles a static binary (`CGO_ENABLED=0`).
+1. **Build stage:** `golang:1.27.2` compiles a static binary (`CGO_ENABLED=0`).
 2. **Runtime stage:** based on MaxMind's geoipupdate image. A generated entrypoint script downloads the database once (and exits if that fails), starts a background refresh loop, then `exec`s the service binary.
 
-Credentials are passed at runtime, never baked into the image.
+Credentials are passed at runtime, never baked into the image. `GEOIPUPDATE_FREQUENCY` sets the refresh interval in hours; `0` downloads once at startup and disables refreshes, and anything that isn't a whole number stops the container with an error. Base images, the geoipupdate image and the buf plugins are all pinned to exact versions, so builds don't change underneath us. A root `.dockerignore` allowlists only the files the Go build needs (`go.mod`, `go.sum`, `cmd/`, `internal/`, `gen/`). Git history, local databases, credentials files and docs never enter the build, and editing docs doesn't invalidate the build cache.
 
 ### 9.2 Kubernetes
 
@@ -326,6 +340,7 @@ flowchart LR
 | Replicas | 2 |
 | Startup ordering | The sidecar's `startupProbe` (database file exists) must pass before the app starts. Native sidecars require Kubernetes 1.29+ |
 | App command | `/app`, bypassing the image's built-in updater because the sidecar does that job |
+| Termination | A 5 s `preStop` pause before SIGTERM. Kubernetes removes the pod from the Service endpoints at the same moment it starts terminating it, and other nodes take a moment to notice, so the pause lets the pod serve requests still routed to it. The app then drains in-flight requests for up to 10 s, within a 30 s `terminationGracePeriodSeconds` |
 | Probes | Liveness and readiness both on `GET /health` |
 | Resources | Requests 100m CPU / 128 Mi; limits 500m CPU / 512 Mi |
 
@@ -345,6 +360,9 @@ flowchart LR
 | One health endpoint | Separate `/healthz` and `/readyz` | Liveness and readiness can't differ for this service, so two endpoints would always agree |
 | Stale data doesn't fail health | Fail readiness when data is old | All replicas would go stale together and take the service down. Report it and alert on it instead |
 | Validation lives in `Service.Check` | Validate in each adapter | One set of rules for both protocols. Adapters only map `ErrInvalidArgument` to their client-error code |
+| Ignore and log invalid country codes | Reject the request with `ErrInvalidArgument` | Rejecting would fail logins for every user of a misconfigured customer, not just those in the mistyped country. An error log still makes the misconfiguration visible |
+| Check codes against the full ISO list | Only check the format (two letters) | A format check misses the most likely real mistake, `"UK"` for `"GB"` |
+| Structured JSON logs via `log/slog` | Plain-text `log` | Fields such as `status`, `duration_ms` and `invalid` can be queried and alerted on without parsing text |
 | gRPC reflection enabled | Require the `.proto` file | Easier debugging with grpcurl and Postman. The schema isn't sensitive and the port is cluster-internal |
 | Commit generated gRPC code | Generate at build time | Builds need neither buf nor network access. The `.proto` stays the source of truth |
 | Tests use MaxMind's test database | Real GeoLite data | The real database can't be redistributed, and live data changes over time. The test database is freely licensed and has fixed records |
@@ -353,11 +371,9 @@ flowchart LR
 
 | Item | Notes |
 |---|---|
-| Country-code format validation | Planned: reject entries that aren't two letters with `ErrInvalidArgument`, so a malformed customer configuration fails loudly instead of silently never matching |
 | VPN and proxy detection | Out of scope for phase one. Would need a different data source, such as MaxMind's anonymous IP database |
 | Metrics | No Prometheus endpoint yet. Candidates: requests by outcome and reason, latency, reload failures, and data age |
-| Structured logging | Logs are plain text. Moving to `log/slog` with JSON output would make them easier to query |
 | gRPC load balancing | gRPC holds long-lived HTTP/2 connections, so a ClusterIP Service balances per connection, not per request. With many gateway instances this evens out; otherwise use a headless Service with client-side balancing |
-| Pinning the updater image | The Dockerfile's runtime stage uses `geoipupdate:latest`, while the Kubernetes sidecar pins `v8.0.0`. Pinning both makes builds reproducible |
 | Pod hardening | Add a `securityContext` (non-root, read-only root filesystem, dropped capabilities) and a PodDisruptionBudget |
+| Identifying misconfigured customers | The service never receives a customer ID, so the invalid-country-code error log can name the bad value (e.g. `"USA"`) but not which customer's list contains it; operators have to search the customer database for it. Accepted for now. If the gateway adopts a request ID or tracing header more broadly, the service should log it on every request so these errors can be traced to the customer |
 | MaxMind download limits at scale | Each pod's sidecar downloads independently. Many replicas should switch to a single CronJob writing to shared storage, as described in the updates guide |

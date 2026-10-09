@@ -1,0 +1,9 @@
+# Send Docker only what the Go build needs. Everything else (git history, the local
+# GeoLite database, credentials files, local binaries, docs) stays out of the build.
+# This is an allowlist: a new top-level Go directory must be added here too.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!gen/

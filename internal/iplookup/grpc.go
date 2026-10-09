@@ -3,7 +3,7 @@ package iplookup
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -27,13 +27,13 @@ type grpcServer struct {
 //	grpc.health.v1.Health              SERVING while the server is up, matching GET /health
 //
 // Server reflection is enabled, so tools like grpcurl can discover the API without the
-// .proto file.
+// .proto file. Every unary call is logged when it completes.
 //
 // It mirrors the HTTP handler's behaviour, mapping errors to gRPC status codes
 // (INVALID_ARGUMENT, INTERNAL). Serve it with grpc.Server.Serve and stop it with
 // GracefulStop.
 func (s *Service) GRPCServer(opts ...grpc.ServerOption) *grpc.Server {
-	srv := grpc.NewServer(opts...)
+	srv := grpc.NewServer(append([]grpc.ServerOption{grpc.ChainUnaryInterceptor(logUnary)}, opts...)...)
 	pb.RegisterIPLookupServiceServer(srv, &grpcServer{svc: s})
 	healthpb.RegisterHealthServer(srv, health.NewServer())
 	reflection.Register(srv)
@@ -46,7 +46,7 @@ func (g *grpcServer) Check(_ context.Context, req *pb.CheckRequest) (*pb.CheckRe
 	case errors.Is(err, ErrInvalidArgument):
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	case err != nil:
-		log.Println("Error checking IP:", err)
+		slog.Error("lookup failed", "error", err)
 		return nil, status.Error(codes.Internal, "lookup failed")
 	}
 	return &pb.CheckResponse{Country: res.Country, Allowed: res.Allowed, Reason: pbReasons[res.Reason]}, nil

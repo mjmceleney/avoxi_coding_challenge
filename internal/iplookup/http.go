@@ -3,7 +3,7 @@ package iplookup
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -27,11 +27,13 @@ const maxRequestBytes = 64 << 10
 //	POST /v1/check   {"ip": "1.2.3.4", "allowed_countries": ["US", "GB"]}
 //	              -> {"country": "US", "allowed": true}
 //	GET  /health    -> {"status": "ok", "database_build": "2026-10-06T21:21:33Z"}
+//
+// Every request is logged when it completes.
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/check", s.handleCheck)
 	mux.HandleFunc("GET /health", s.handleHealth)
-	return mux
+	return logRequests(mux)
 }
 
 func (s *Service) handleCheck(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +50,7 @@ func (s *Service) handleCheck(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrInvalidArgument):
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 	case err != nil:
-		log.Println("Error checking IP:", err)
+		slog.Error("lookup failed", "error", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "lookup failed"})
 	default:
 		writeJSON(w, http.StatusOK, res)
@@ -74,6 +76,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Println("Error writing response:", err)
+		slog.Warn("writing response failed", "error", err)
 	}
 }
